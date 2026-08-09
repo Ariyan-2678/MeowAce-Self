@@ -1,0 +1,15 @@
+{
+  "multi_session": false,
+  "api_id": 123456,
+  "api_hash": "YOUR_API_HASH_HERE",
+  "proxy": {
+    "enabled": false,
+    "type": "socks5",
+    "host": "127.0.0.1",
+    "port": 1080,
+    "username": "",
+    "password": "",
+    "secret": ""
+  }
+}
+

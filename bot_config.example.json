@@ -1,0 +1,17 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN_HERE",
+  "admin_id": 123456789,
+  "bot_api_id": 123456,
+  "bot_api_hash": "YOUR_API_HASH_HERE",
+  "card_number": "6037997000000000",
+  "mode": "private",
+  "public_type": "free",
+  "subscription": {
+    "price_toman": 50000,
+    "duration_days": 30
+  },
+  "trial": {
+    "enabled": true,
+    "duration_hours": 24
+  }
+}

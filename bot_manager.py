@@ -1,0 +1,737 @@
+import os
+import sys
+import time
+import re
+import asyncio
+from telethon import TelegramClient, events, Button
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+    PhoneNumberInvalidError,
+    RPCError
+)
+
+from multisession import (
+    load_bot_config, save_bot_config,
+    load_bot_data, save_bot_data,
+    is_admin, can_user_access,
+    start_user_client, stop_user_client,
+    get_session_filepath, active_user_clients
+)
+from modules.proxy import get_proxy_kwargs
+from modules.utils import convert_persian_digits
+
+user_login_states = {}
+user_admin_states = {}
+bot_client_instance = None
+
+def get_main_menu_buttons(user_id: int, bot_config: dict, bot_data: dict):
+    buttons = []
+    
+    uid_str = str(user_id)
+    running = user_id in active_user_clients
+    
+    if running:
+        buttons.append([Button.inline("🛑 خروج / توقف سشن", b"btn_logout")])
+    else:
+        buttons.append([Button.inline("🔐 ورود / شروع حساب", b"btn_login")])
+
+    buttons.append([Button.inline("📊 وضعیت اشتراک", b"btn_status")])
+
+    mode = bot_config.get("mode", "private")
+    public_type = bot_config.get("public_type", "free")
+    trial_cfg = bot_config.get("trial", {})
+    
+    if mode == "public" and public_type == "paid":
+        buttons.append([Button.inline("💳 خرید اشتراک", b"btn_buy_sub")])
+        if trial_cfg.get("enabled", False):
+            u_info = bot_data.get("users", {}).get(uid_str, {})
+            if not u_info.get("trial_used", False):
+                buttons.append([Button.inline("🎁 تست رایگان", b"btn_trial")])
+
+    if is_admin(user_id, bot_config):
+        buttons.append([Button.inline("⚙️ پنل مدیریت ادمین", b"btn_admin_panel")])
+
+    return buttons
+
+def get_admin_panel_buttons(bot_config: dict):
+    mode = bot_config.get("mode", "private")
+    pub_type = bot_config.get("public_type", "free")
+    trial_on = bot_config.get("trial", {}).get("enabled", False)
+    
+    mode_str = "🔒 خصوصی (Private)" if mode == "private" else "🌐 عمومی (Public)"
+    pub_str = "🆓 رایگان" if pub_type == "free" else "💰 اشتراکی"
+    trial_str = "🟢 روشن" if trial_on else "🔴 خاموش"
+
+    return [
+        [Button.inline(f"حالت ربات: {mode_str}", b"toggle_mode")],
+        [Button.inline(f"نوع حالت عمومی: {pub_str}", b"toggle_pub_type")],
+        [Button.inline(f"تست رایگان: {trial_str}", b"toggle_trial")],
+        [Button.inline("✏️ تغییر قیمت اشتراک", b"set_price"), Button.inline("✏️ تغییر مدت اشتراک (روز)", b"set_days")],
+        [Button.inline("✏️ تغییر مدت تست (ساعت)", b"set_trial_hrs"), Button.inline("💳 تغییر شماره کارت", b"set_card")],
+        [Button.inline("👥 لیست کاربران و سشن‌ها", b"admin_list_users"), Button.inline("📋 لیست وایت‌لیست", b"admin_list_wl")],
+        [Button.inline("➕ افزودن به وایت‌لیست", b"admin_add_wl"), Button.inline("➖ حذف از وایت‌لیست", b"admin_rem_wl")],
+        [Button.inline("➕ اعطای اشتراک", b"admin_add_sub"), Button.inline("🛑 توقف سشن کاربر", b"admin_stop_user")],
+        [Button.inline("🔙 بازگشت به منوی اصلی", b"btn_main_menu")]
+    ]
+
+def format_user_status(user_id: int, bot_config: dict, bot_data: dict) -> str:
+    uid_str = str(user_id)
+    u_info = bot_data.get("users", {}).get(uid_str, {})
+    sub_exp = u_info.get("subscription_expire", 0)
+    running = user_id in active_user_clients
+
+    run_str = "🟢 آنلاین و فعال" if running else "🔴 غیرفعال / خاموش"
+    
+    if is_admin(user_id, bot_config):
+        sub_str = "👑 مدیر اصلی (دسترسی نامحدود)"
+    elif sub_exp == -1:
+        sub_str = "♾️ دائم (وایت‌لیست)"
+    elif sub_exp > time.time():
+        rem_sec = sub_exp - time.time()
+        rem_days = int(rem_sec // 86400)
+        rem_hrs = int((rem_sec % 86400) // 3600)
+        sub_str = f"🟢 فعال (باقیمانده: {rem_days} روز و {rem_hrs} ساعت)"
+    else:
+        sub_str = "🔴 منقضی شده"
+
+    return (
+        f"📊 **وضعیت حساب کاربری شما**\n\n"
+        f"👤 **شناسه:** `{user_id}`\n"
+        f"⚡ **وضعیت سشن:** {run_str}\n"
+        f"⏱️ **وضعیت اشتراک:** {sub_str}\n"
+    )
+
+async def notify_admin_payment_request(bot: TelegramClient, payment_id: str, user_id: int, bot_config: dict, bot_data: dict):
+    admin_id = bot_config.get("admin_id")
+    if not admin_id:
+        return
+
+    sub_cfg = bot_config.get("subscription", {})
+    price = sub_cfg.get("price_toman", 50000)
+    days = sub_cfg.get("duration_days", 30)
+
+    u_info = bot_data.get("users", {}).get(str(user_id), {})
+    name = u_info.get("first_name", "کاربر")
+    username = f"@{u_info['username']}" if u_info.get("username") else "بدون یوزرنیم"
+
+    msg = (
+        f"📥 **درخواست جدید خرید اشتراک**\n\n"
+        f"👤 **کاربر:** {name} ({username}) [`{user_id}`]\n"
+        f"💰 **مبلغ:** {price:,} تومان\n"
+        f"⏱️ **مدت:** {days} روز\n\n"
+        f"آیا درخواست اولیه کاربر تایید می‌شود؟"
+    )
+    buttons = [
+        [Button.inline("✅ تایید (ارسال شماره کارت)", f"pay_app1_{payment_id}".encode())],
+        [Button.inline("❌ رد درخواست", f"pay_rej1_{payment_id}".encode())]
+    ]
+    try:
+        await bot.send_message(admin_id, msg, buttons=buttons)
+    except Exception as e:
+        print(f"[!] Error notifying admin of payment request: {e}")
+
+async def notify_admin_receipt(bot: TelegramClient, payment_id: str, user_id: int, receipt_msg: events.NewMessage.Event, bot_config: dict, bot_data: dict):
+    admin_id = bot_config.get("admin_id")
+    if not admin_id:
+        return
+
+    sub_cfg = bot_config.get("subscription", {})
+    price = sub_cfg.get("price_toman", 50000)
+    days = sub_cfg.get("duration_days", 30)
+
+    u_info = bot_data.get("users", {}).get(str(user_id), {})
+    name = u_info.get("first_name", "کاربر")
+    username = f"@{u_info['username']}" if u_info.get("username") else "بدون یوزرنیم"
+
+    msg_caption = (
+        f"📥 **رسید واریز جدید دریافت شد!**\n\n"
+        f"👤 **کاربر:** {name} ({username}) [`{user_id}`]\n"
+        f"💰 **مبلغ:** {price:,} تومان\n"
+        f"⏱️ **مدت:** {days} روز\n\n"
+        f"لطفاً تصویر رسید را بررسی و تایید یا رد کنید:"
+    )
+    buttons = [
+        [Button.inline("✅ تایید واریز و فعال‌سازی اشتراک", f"pay_app2_{payment_id}".encode())],
+        [Button.inline("❌ رد رسید", f"pay_rej2_{payment_id}".encode())]
+    ]
+    try:
+        if receipt_msg.media:
+            await bot.send_message(admin_id, msg_caption, file=receipt_msg.media, buttons=buttons)
+        else:
+            await bot.send_message(admin_id, msg_caption, buttons=buttons)
+    except Exception as e:
+        print(f"[!] Error forwarding receipt to admin: {e}")
+
+async def start_bot_manager(main_config: dict):
+    global bot_client_instance
+    bot_config = load_bot_config()
+    
+    bot_token = bot_config.get("bot_token")
+    admin_id = bot_config.get("admin_id")
+    bot_api_id = bot_config.get("bot_api_id")
+    bot_api_hash = bot_config.get("bot_api_hash")
+
+    if not bot_token or bot_token == "YOUR_BOT_TOKEN_HERE":
+        print("[!] Error: 'bot_token' is missing or invalid in 'bot_config.json'. Please configure it.")
+        sys.exit(1)
+    if not bot_api_id or not bot_api_hash or bot_api_id == 123456:
+        print("[!] Error: 'bot_api_id' / 'bot_api_hash' missing in 'bot_config.json'.")
+        sys.exit(1)
+
+    proxy_kwargs = get_proxy_kwargs(main_config)
+    
+    bot = TelegramClient("sessions/bot_session", bot_api_id, bot_api_hash, **proxy_kwargs)
+    await bot.start(bot_token=bot_token)
+    bot_client_instance = bot
+
+    me = await bot.get_me()
+    print(f"[+] MultiSession Management Bot started as: @{me.username} [ID: {me.id}]")
+
+    @bot.on(events.NewMessage(pattern=r'^/start'))
+    async def _start_handler(ev):
+        user_id = ev.sender_id
+        bot_cfg = load_bot_config()
+        bot_dt = load_bot_data()
+        
+        # update user metadata
+        uid_str = str(user_id)
+        if uid_str not in bot_dt["users"]:
+            bot_dt["users"][uid_str] = {
+                "created_at": time.time(),
+                "trial_used": False,
+                "subscription_expire": 0
+            }
+        sender = await ev.get_sender()
+        if sender:
+            bot_dt["users"][uid_str]["first_name"] = getattr(sender, 'first_name', '') or ''
+            bot_dt["users"][uid_str]["username"] = getattr(sender, 'username', '') or ''
+        save_bot_data(bot_dt)
+
+        welcome_text = (
+            f"👋 **سلام {sender.first_name if sender else ''}! به ربات مدیریت MeowAce-Self خوش آمدید.**\n\n"
+            f"از طریق این ربات می‌توانید حساب خودکار تلگرام (Selfbot) خود را فعال، مدیریت یا تمدید کنید."
+        )
+        buttons = get_main_menu_buttons(user_id, bot_cfg, bot_dt)
+        await ev.respond(welcome_text, buttons=buttons)
+
+    @bot.on(events.CallbackQuery)
+    async def _callback_handler(ev):
+        user_id = ev.sender_id
+        data = ev.data.decode('utf-8')
+        bot_cfg = load_bot_config()
+        bot_dt = load_bot_data()
+
+        if data == "btn_main_menu":
+            buttons = get_main_menu_buttons(user_id, bot_cfg, bot_dt)
+            await ev.edit("📌 **منوی اصلی:**", buttons=buttons)
+            return
+
+        elif data == "btn_status":
+            st_text = format_user_status(user_id, bot_cfg, bot_dt)
+            buttons = [[Button.inline("🔙 بازگشت", b"btn_main_menu")]]
+            await ev.edit(st_text, buttons=buttons)
+            return
+
+        elif data == "btn_trial":
+            trial_cfg = bot_cfg.get("trial", {})
+            if not trial_cfg.get("enabled", False):
+                await ev.answer("❌ تست رایگان در حال حاضر فعال نیست.", alert=True)
+                return
+            
+            uid_str = str(user_id)
+            u_info = bot_dt["users"].get(uid_str, {})
+            if u_info.get("trial_used", False):
+                await ev.answer("❌ شما قبلاً از مهلت تست رایگان استفاده کرده‌اید.", alert=True)
+                return
+
+            dur_hrs = trial_cfg.get("duration_hours", 24)
+            add_sec = dur_hrs * 3600
+            curr_exp = u_info.get("subscription_expire", 0)
+            base_t = max(time.time(), curr_exp)
+            new_exp = base_t + add_sec
+            
+            u_info["subscription_expire"] = new_exp
+            u_info["trial_used"] = True
+            bot_dt["users"][uid_str] = u_info
+            save_bot_data(bot_dt)
+
+            await ev.edit(
+                f"🎉 **تست رایگان {dur_hrs} ساعته برای شما با موفقیت فعال شد!**\n\n"
+                f"اکنون می‌توانید از گزینه «🔐 ورود / شروع حساب» جهت فعال‌سازی ربات خود استفاده کنید.",
+                buttons=[[Button.inline("🔐 ورود به حساب", b"btn_login")], [Button.inline("🔙 منوی اصلی", b"btn_main_menu")]]
+            )
+            return
+
+        elif data == "btn_logout":
+            await ev.answer("در حال توقف و لاگ‌اوت سشن...")
+            await stop_user_client(user_id, logout=True)
+            await ev.edit(
+                "🛑 **سشن کاربری شما با موفقیت غیرفعال و لاگ‌اوت شد.**\n\n"
+                "تمامی کانفیگ‌ها و الیاس‌های شما محفوظ است.",
+                buttons=[[Button.inline("🔙 منوی اصلی", b"btn_main_menu")]]
+            )
+            return
+
+        elif data == "btn_buy_sub":
+            sub_cfg = bot_cfg.get("subscription", {})
+            price = sub_cfg.get("price_toman", 50000)
+            days = sub_cfg.get("duration_days", 30)
+
+            msg = (
+                f"💳 **خرید اشتراک ربات خودکار MeowAce-Self**\n\n"
+                f"💰 **قیمت:** {price:,} تومان\n"
+                f"⏱️ **مدت زمان:** {days} روز\n\n"
+                f"پس از کلیک بر روی دکمه زیر، درخواست شما برای مدیر ارسال شده و پس از تایید اولیه، شماره کارت جهت واریز خدمتتان ارسال می‌گردد."
+            )
+            buttons = [
+                [Button.inline("📌 درخواست شماره کارت و پرداخت", b"req_payment")],
+                [Button.inline("🔙 بازگشت", b"btn_main_menu")]
+            ]
+            await ev.edit(msg, buttons=buttons)
+            return
+
+        elif data == "req_payment":
+            pid = f"pay_{user_id}_{int(time.time())}"
+            bot_dt["pending_payments"][pid] = {
+                "user_id": user_id,
+                "status": "awaiting_admin_approval",
+                "created_at": time.time()
+            }
+            save_bot_data(bot_dt)
+
+            await ev.edit(
+                "⏳ **درخواست خرید شما برای مدیر ارسال شد.**\nلطفاً شکیبا باشید، به محض تایید مدیر شماره کارت خدمت شما ارسال خواهد شد.",
+                buttons=[[Button.inline("🔙 منوی اصلی", b"btn_main_menu")]]
+            )
+            await notify_admin_payment_request(bot, pid, user_id, bot_cfg, bot_dt)
+            return
+
+        elif data.startswith("pay_app1_"):
+            pid = data.replace("pay_app1_", "")
+            pay_info = bot_dt.get("pending_payments", {}).get(pid)
+            if not pay_info:
+                await ev.answer("درخواست یافت نشد.", alert=True)
+                return
+
+            pay_info["status"] = "awaiting_receipt"
+            save_bot_data(bot_dt)
+            target_uid = pay_info["user_id"]
+            
+            card_num = bot_cfg.get("card_number", "6037997000000000")
+            sub_cfg = bot_cfg.get("subscription", {})
+            price = sub_cfg.get("price_toman", 50000)
+
+            user_login_states[target_uid] = {"step": "AWAITING_RECEIPT", "payment_id": pid}
+
+            try:
+                await bot.send_message(
+                    target_uid,
+                    f"✅ **درخواست خرید شما توسط مدیر تایید شد!**\n\n"
+                    f"💳 **شماره کارت جهت واریز:**\n`{card_num}`\n\n"
+                    f"💰 **مبلغ:** {price:,} تومان\n\n"
+                    f"لطفاً تصویر یا عکس فیش واریزی خود را همین‌جا ارسال کنید."
+                )
+            except Exception as e:
+                print(f"[!] Failed to send card to user {target_uid}: {e}")
+
+            await ev.edit(f"✅ درخواست اولیه کاربر `{target_uid}` تایید و شماره کارت ارسال گردید.")
+            return
+
+        elif data.startswith("pay_rej1_"):
+            pid = data.replace("pay_rej1_", "")
+            pay_info = bot_dt.get("pending_payments", {}).pop(pid, None)
+            save_bot_data(bot_dt)
+            if pay_info:
+                target_uid = pay_info["user_id"]
+                try:
+                    await bot.send_message(target_uid, "❌ **درخواست خرید اشتراک شما توسط مدیر رد شد.**")
+                except Exception:
+                    pass
+            await ev.edit("❌ درخواست خرید رد شد.")
+            return
+
+        elif data.startswith("pay_app2_"):
+            pid = data.replace("pay_app2_", "")
+            pay_info = bot_dt.get("pending_payments", {}).pop(pid, None)
+            if not pay_info:
+                await ev.answer("پرداخت یافت نشد یا قبلاً پردازش شده.", alert=True)
+                return
+
+            target_uid = pay_info["user_id"]
+            uid_str = str(target_uid)
+
+            sub_cfg = bot_cfg.get("subscription", {})
+            days = sub_cfg.get("duration_days", 30)
+            add_sec = days * 86400
+
+            u_info = bot_dt["users"].get(uid_str, {})
+            curr_exp = u_info.get("subscription_expire", 0)
+            base_t = max(time.time(), curr_exp)
+            new_exp = base_t + add_sec
+            
+            u_info["subscription_expire"] = new_exp
+            bot_dt["users"][uid_str] = u_info
+            save_bot_data(bot_dt)
+
+            user_login_states.pop(target_uid, None)
+
+            try:
+                await bot.send_message(
+                    target_uid,
+                    f"🎉 **واریز شما تایید و اشتراک {days} روزه با موفقیت فعال شد!**\n\n"
+                    f"اکنون می‌توانید از گزینه «🔐 ورود / شروع حساب» استفاده کنید.",
+                    buttons=[[Button.inline("🔐 ورود به حساب", b"btn_login")]]
+                )
+            except Exception as e:
+                print(f"[!] Error notifying user {target_uid} of sub activation: {e}")
+
+            await ev.edit(f"🎉 اشتراک {days} روزه کاربر `{target_uid}` فعال شد.")
+            return
+
+        elif data.startswith("pay_rej2_"):
+            pid = data.replace("pay_rej2_", "")
+            pay_info = bot_dt.get("pending_payments", {}).pop(pid, None)
+            save_bot_data(bot_dt)
+            if pay_info:
+                target_uid = pay_info["user_id"]
+                user_login_states.pop(target_uid, None)
+                try:
+                    await bot.send_message(target_uid, "❌ **فیش واریزی شما توسط مدیر تایید نشد.**")
+                except Exception:
+                    pass
+            await ev.edit("❌ رسید واریزی رد شد.")
+            return
+
+        elif data == "btn_login":
+            if not can_user_access(user_id, bot_cfg, bot_dt):
+                await ev.answer("❌ شما مجاز به فعال‌سازی ربات نیستید. (نیاز به اشتراک یا قرارگیری در وایت‌لیست)", alert=True)
+                return
+
+            uid_str = str(user_id)
+            u_info = bot_dt["users"].get(uid_str, {})
+            api_id = u_info.get("api_id")
+            api_hash = u_info.get("api_hash")
+
+            if api_id and api_hash:
+                buttons = [
+                    [Button.inline("✅ استفاده از API ID و Hash ذخیره‌شده", b"use_saved_creds")],
+                    [Button.inline("✏️ ورود API ID و Hash جدید", b"enter_new_creds")],
+                    [Button.inline("🔙 لغو", b"btn_main_menu")]
+                ]
+                await ev.edit(
+                    f"🔑 **اطلاعات API شما قبلاً ذخیره شده است:**\n\n"
+                    f"• **API ID:** `{api_id}`\n"
+                    f"• **API Hash:** `{api_hash[:4]}...`\n\n"
+                    f"آیا می‌خواهید با همین اطلاعات وارد شوید؟",
+                    buttons=buttons
+                )
+            else:
+                user_login_states[user_id] = {"step": "ENTER_API_ID"}
+                await ev.edit("🔑 لطفاً **API ID** حساب تلگرام خود را وارد کنید (مثال: `1234567`):")
+            return
+
+        elif data == "use_saved_creds":
+            uid_str = str(user_id)
+            u_info = bot_dt["users"].get(uid_str, {})
+            api_id = u_info.get("api_id")
+            api_hash = u_info.get("api_hash")
+            
+            user_login_states[user_id] = {
+                "step": "ENTER_PHONE",
+                "api_id": api_id,
+                "api_hash": api_hash
+            }
+            await ev.edit("📱 لطفاً **شماره تلفن** حساب تلگرام خود را با کد کشور وارد کنید (مثال: `+989123456789`):")
+            return
+
+        elif data == "enter_new_creds":
+            user_login_states[user_id] = {"step": "ENTER_API_ID"}
+            await ev.edit("🔑 لطفاً **API ID** جدید حساب تلگرام خود را وارد کنید:")
+            return
+
+        # ADMIN PANEL BUTTONS
+        elif data == "btn_admin_panel":
+            if not is_admin(user_id, bot_cfg):
+                await ev.answer("❌ دسترسی غیرمجاز.", alert=True)
+                return
+            buttons = get_admin_panel_buttons(bot_cfg)
+            await ev.edit("⚙️ **پنل مدیریت ادمین:**", buttons=buttons)
+            return
+
+        elif data == "toggle_mode":
+            if not is_admin(user_id, bot_cfg): return
+            curr = bot_cfg.get("mode", "private")
+            bot_cfg["mode"] = "public" if curr == "private" else "private"
+            save_bot_config(bot_cfg)
+            await ev.edit("⚙️ **پنل مدیریت ادمین:**", buttons=get_admin_panel_buttons(bot_cfg))
+            return
+
+        elif data == "toggle_pub_type":
+            if not is_admin(user_id, bot_cfg): return
+            curr = bot_cfg.get("public_type", "free")
+            bot_cfg["public_type"] = "paid" if curr == "free" else "free"
+            save_bot_config(bot_cfg)
+            await ev.edit("⚙️ **پنل مدیریت ادمین:**", buttons=get_admin_panel_buttons(bot_cfg))
+            return
+
+        elif data == "toggle_trial":
+            if not is_admin(user_id, bot_cfg): return
+            if "trial" not in bot_cfg: bot_cfg["trial"] = {}
+            curr = bot_cfg["trial"].get("enabled", False)
+            bot_cfg["trial"]["enabled"] = not curr
+            save_bot_config(bot_cfg)
+            await ev.edit("⚙️ **پنل مدیریت ادمین:**", buttons=get_admin_panel_buttons(bot_cfg))
+            return
+
+        elif data in ["set_price", "set_days", "set_trial_hrs", "set_card", "admin_add_wl", "admin_rem_wl", "admin_add_sub", "admin_stop_user"]:
+            if not is_admin(user_id, bot_cfg): return
+            user_admin_states[user_id] = data
+            prompts = {
+                "set_price": "💰 قیمت جدید اشتراک را به تومان وارد کنید (مثال: `50000`):",
+                "set_days": "⏱️ مدت زمان جدید اشتراک را به روز وارد کنید (مثال: `30`):",
+                "set_trial_hrs": "⏳ مدت زمان جدید تست رایگان را به ساعت وارد کنید (مثال: `24`):",
+                "set_card": "💳 شماره کارت جدید را وارد کنید:",
+                "admin_add_wl": "➕ آیدی عددی (User ID) کاربر را جهت افزودن به وایت‌لیست وارد کنید:",
+                "admin_rem_wl": "➖ آیدی عددی کاربر را جهت حذف از وایت‌لیست وارد کنید:",
+                "admin_add_sub": "➕ آیدی کاربر و تعداد روز را با فاصله وارد کنید (مثال: `123456789 30`):",
+                "admin_stop_user": "🛑 آیدی عددی کاربر را جهت متوقف کردن سشن وارد کنید:"
+            }
+            await ev.edit(prompts[data], buttons=[[Button.inline("🔙 لغو", b"btn_admin_panel")]])
+            return
+
+        elif data == "admin_list_users":
+            if not is_admin(user_id, bot_cfg): return
+            users = bot_dt.get("users", {})
+            out = "👥 **لیست کاربران و سشن‌ها:**\n\n"
+            for uid, uinfo in users.items():
+                running = int(uid) in active_user_clients
+                st = "🟢 آنلاین" if running else "🔴 آفلاین"
+                exp = uinfo.get("subscription_expire", 0)
+                exp_str = "دائم" if exp == -1 else (f"تا {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}" if exp > time.time() else "منقضی")
+                out += f"• `{uid}` ({uinfo.get('first_name', '')}) ── {st} | اشتراک: {exp_str}\n"
+            await ev.edit(out[:4000], buttons=[[Button.inline("🔙 بازگشت", b"btn_admin_panel")]])
+            return
+
+        elif data == "admin_list_wl":
+            if not is_admin(user_id, bot_cfg): return
+            wl = bot_dt.get("whitelist", [])
+            out = "📋 **لیست وایت‌لیست:**\n\n" + "\n".join([f"• `{x}`" for x in wl])
+            await ev.edit(out, buttons=[[Button.inline("🔙 بازگشت", b"btn_admin_panel")]])
+            return
+
+    @bot.on(events.NewMessage)
+    async def _message_handler(ev):
+        if ev.text and ev.text.startswith('/'):
+            return
+
+        user_id = ev.sender_id
+        text = ev.text.strip() if ev.text else ""
+        bot_cfg = load_bot_config()
+        bot_dt = load_bot_data()
+
+        # Handle Admin Input Prompt States
+        if user_id in user_admin_states:
+            action = user_admin_states.pop(user_id)
+            if action == "set_price":
+                try:
+                    bot_cfg["subscription"]["price_toman"] = int(text)
+                    save_bot_config(bot_cfg)
+                    await ev.respond("✅ قیمت جدید اشتراک با موفقیت ثبت شد.")
+                except Exception:
+                    await ev.respond("❌ قیمت وارد شده معتبر نیست.")
+            elif action == "set_days":
+                try:
+                    bot_cfg["subscription"]["duration_days"] = int(text)
+                    save_bot_config(bot_cfg)
+                    await ev.respond("✅ مدت زمان جدید اشتراک با موفقیت ثبت شد.")
+                except Exception:
+                    await ev.respond("❌ عدد وارد شده معتبر نیست.")
+            elif action == "set_trial_hrs":
+                try:
+                    bot_cfg["trial"]["duration_hours"] = int(text)
+                    save_bot_config(bot_cfg)
+                    await ev.respond("✅ مدت زمان جدید تست رایگان با موفقیت ثبت شد.")
+                except Exception:
+                    await ev.respond("❌ عدد وارد شده معتبر نیست.")
+            elif action == "set_card":
+                bot_cfg["card_number"] = text
+                save_bot_config(bot_cfg)
+                await ev.respond("✅ شماره کارت جدید با موفقیت ثبت شد.")
+            elif action == "admin_add_wl":
+                try:
+                    target_uid = int(text)
+                    if target_uid not in bot_dt["whitelist"]:
+                        bot_dt["whitelist"].append(target_uid)
+                        save_bot_data(bot_dt)
+                    await ev.respond(f"✅ کاربر `{target_uid}` به وایت‌لیست اضافه شد.")
+                except Exception:
+                    await ev.respond("❌ آیدی وارد شده معتبر نیست.")
+            elif action == "admin_rem_wl":
+                try:
+                    target_uid = int(text)
+                    if target_uid in bot_dt["whitelist"]:
+                        bot_dt["whitelist"].remove(target_uid)
+                        save_bot_data(bot_dt)
+                    await ev.respond(f"✅ کاربر `{target_uid}` از وایت‌لیست حذف شد.")
+                except Exception:
+                    await ev.respond("❌ آیدی وارد شده معتبر نیست.")
+            elif action == "admin_add_sub":
+                try:
+                    parts = text.split()
+                    target_uid = int(parts[0])
+                    days = int(parts[1])
+                    uid_str = str(target_uid)
+                    u_info = bot_dt["users"].get(uid_str, {})
+                    curr_exp = u_info.get("subscription_expire", 0)
+                    base_t = max(time.time(), curr_exp)
+                    u_info["subscription_expire"] = base_t + days * 86400
+                    bot_dt["users"][uid_str] = u_info
+                    save_bot_data(bot_dt)
+                    await ev.respond(f"✅ {days} روز اشتراک با موفقیت برای کاربر `{target_uid}` فعال شد.")
+                except Exception:
+                    await ev.respond("❌ فرمت وارد شده اشتباه است. مثال: `123456789 30`")
+            elif action == "admin_stop_user":
+                try:
+                    target_uid = int(text)
+                    await stop_user_client(target_uid, logout=True)
+                    await ev.respond(f"🛑 سشن کاربر `{target_uid}` متوقف و لاگ‌اوت شد.")
+                except Exception as e:
+                    await ev.respond(f"❌ خطا در متوقف سازی سشن: {e}")
+            return
+
+        # Handle Receipt Submission
+        if user_id in user_login_states and user_login_states[user_id].get("step") == "AWAITING_RECEIPT":
+            state = user_login_states[user_id]
+            pid = state.get("payment_id")
+            await ev.respond("✅ **فیش واریزی شما دریافت شد.** لطفا منتظر بررسی و تایید ادمین باشید.")
+            await notify_admin_receipt(bot, pid, user_id, ev, bot_cfg, bot_dt)
+            return
+
+        # Handle Login States
+        if user_id in user_login_states:
+            state = user_login_states[user_id]
+            step = state.get("step")
+
+            if step == "ENTER_API_ID":
+                try:
+                    api_id = int(text)
+                    state["api_id"] = api_id
+                    state["step"] = "ENTER_API_HASH"
+                    await ev.respond("🔑 عالی! حالا **API Hash** حساب تلگرام خود را وارد کنید:")
+                except ValueError:
+                    await ev.respond("❌ API ID باید عدد باشد. لطفاً مجدداً وارد کنید:")
+
+            elif step == "ENTER_API_HASH":
+                state["api_hash"] = text
+                state["step"] = "ENTER_PHONE"
+                await ev.respond("📱 لطفاً **شماره تلفن** حساب تلگرام خود را با کد کشور وارد کنید (مثال: `+989123456789`):")
+
+            elif step == "ENTER_PHONE":
+                phone = text.replace(" ", "")
+                state["phone"] = phone
+                api_id = state["api_id"]
+                api_hash = state["api_hash"]
+
+                await ev.respond("⚡ در حال اتصال به سرور تلگرام و ارسال کد تایید...")
+                sess_file = get_session_filepath(user_id)
+                if os.path.exists(sess_file):
+                    try: os.remove(sess_file)
+                    except Exception: pass
+
+                proxy_kw = get_proxy_kwargs(main_config)
+                temp_client = TelegramClient(f"sessions/session_{user_id}", api_id, api_hash, **proxy_kw)
+                try:
+                    await temp_client.connect()
+                    res = await temp_client.send_code_request(phone)
+                    state["temp_client"] = temp_client
+                    state["phone_code_hash"] = res.phone_code_hash
+                    state["step"] = "ENTER_OTP"
+                    await ev.respond(
+                        "📩 **کد تایید** ارسال شده به تلگرام خود را وارد کنید:\n\n"
+                        "💡 **جهت جلوگیری از مسدود شدن پیام توسط تلگرام:**\n"
+                        "• ارسال با **اعداد فارسی** بدون فاصله (مثال: `۱۲۳۴۵`)\n"
+                        "• یا ارسال با **اعداد انگلیسی** همراه با فاصله یا خط‌تیره (مثال: `1 2 3 4 5` یا `1-2-3-4-5`)"
+                    )
+                except PhoneNumberInvalidError:
+                    await temp_client.disconnect()
+                    await ev.respond("❌ شماره تلفن وارد شده معتبر نیست. لطفاً مجدداً شماره تلفن را وارد کنید:")
+                except Exception as e:
+                    try: await temp_client.disconnect()
+                    except Exception: pass
+                    await ev.respond(f"❌ خطا در ارسال کد تایید: {e}\nلطفاً مجدداً تلاش کنید.")
+                    user_login_states.pop(user_id, None)
+
+            elif step == "ENTER_OTP":
+                raw_txt = convert_persian_digits(text or "")
+                otp_code = "".join(re.findall(r'\d', raw_txt))
+                temp_client = state.get("temp_client")
+                phone = state.get("phone")
+                phone_code_hash = state.get("phone_code_hash")
+                api_id = state["api_id"]
+                api_hash = state["api_hash"]
+
+                try:
+                    await temp_client.sign_in(phone=phone, code=otp_code, phone_code_hash=phone_code_hash)
+                    me = await temp_client.get_me()
+                    await temp_client.disconnect()
+
+                    # Save credentials
+                    uid_str = str(user_id)
+                    bot_dt["users"][uid_str]["api_id"] = api_id
+                    bot_dt["users"][uid_str]["api_hash"] = api_hash
+                    bot_dt["users"][uid_str]["phone"] = phone
+                    save_bot_data(bot_dt)
+
+                    proxy_kw = get_proxy_kwargs(main_config)
+                    success, msg = await start_user_client(user_id, api_id, api_hash, proxy_kw)
+                    user_login_states.pop(user_id, None)
+                    if success:
+                        await ev.respond(f"🎉 **ورود با موفقیت انجام شد!**\n{msg}")
+                    else:
+                        await ev.respond(f"❌ خطا در فعال‌سازی سشن: {msg}")
+
+                except SessionPasswordNeededError:
+                    state["step"] = "ENTER_2FA"
+                    await ev.respond("🔐 این حساب دارای **رمز عبور دو مرحله‌ای (2FA)** است. لطفاً رمز عبور خود را وارد کنید:")
+                except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+                    await ev.respond("❌ کد تایید اشتباه یا منقضی شده است. لطفاً کد تایید را مجدداً وارد کنید:")
+                except Exception as e:
+                    try: await temp_client.disconnect()
+                    except Exception: pass
+                    await ev.respond(f"❌ خطا در ورود: {e}")
+                    user_login_states.pop(user_id, None)
+
+            elif step == "ENTER_2FA":
+                password = text
+                temp_client = state.get("temp_client")
+                api_id = state["api_id"]
+                api_hash = state["api_hash"]
+
+                try:
+                    await temp_client.sign_in(password=password)
+                    me = await temp_client.get_me()
+                    await temp_client.disconnect()
+
+                    uid_str = str(user_id)
+                    bot_dt["users"][uid_str]["api_id"] = api_id
+                    bot_dt["users"][uid_str]["api_hash"] = api_hash
+                    save_bot_data(bot_dt)
+
+                    proxy_kw = get_proxy_kwargs(main_config)
+                    success, msg = await start_user_client(user_id, api_id, api_hash, proxy_kw)
+                    user_login_states.pop(user_id, None)
+                    if success:
+                        await ev.respond(f"🎉 **ورود با موفقیت انجام شد!**\n{msg}")
+                    else:
+                        await ev.respond(f"❌ خطا در فعال‌سازی سشن: {msg}")
+
+                except PasswordHashInvalidError:
+                    await ev.respond("❌ رمز عبور دو مرحله‌ای اشتباه است. لطفاً مجدداً وارد کنید:")
+                except Exception as e:
+                    try: await temp_client.disconnect()
+                    except Exception: pass
+                    await ev.respond(f"❌ خطا در ورود: {e}")
+                    user_login_states.pop(user_id, None)

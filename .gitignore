@@ -1,0 +1,13 @@
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Session & Config files
+*.session
+*.session-journal
+config.json
+bot_config.json
+bot_data.json
+settings/
+sessions/
