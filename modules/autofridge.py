@@ -51,7 +51,22 @@ async def run_autofridge_loop(client, chat_id: int):
                             sleep_dur = 1800
                             break
                             
-                        first_btn = latest.buttons[0][0]
+                        # Find first non-upgrade button (skip upgrade button 'ارتقا')
+                        first_btn = None
+                        for row in latest.buttons:
+                            for b in row:
+                                if b.text and "ارتقا" in b.text:
+                                    continue
+                                first_btn = b
+                                break
+                            if first_btn:
+                                break
+
+                        if not first_btn:
+                            # no fish items in fridge
+                            sleep_dur = 1800
+                            break
+
                         await asyncio.sleep(1.8)
                         
                         f_fut = asyncio.Future()
