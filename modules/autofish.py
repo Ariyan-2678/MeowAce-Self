@@ -113,7 +113,7 @@ async def run_autofish_loop(client, chat_id: int):
                                     try:
                                         f_msg = await asyncio.wait_for(fridge_fut, timeout=12.0)
                                         f_txt = f_msg.text or ""
-                                        if "جا نداره" in f_txt or "یخچال" in f_txt:
+                                        if any(k in f_txt for k in ["جا نداره", "پر", "قبل", "موجود", "یخچال"]):
                                             s_btn = None
                                             if f_msg.buttons:
                                                 for r in f_msg.buttons:
@@ -124,6 +124,7 @@ async def run_autofish_loop(client, chat_id: int):
                                                     if s_btn:
                                                         break
                                             if s_btn:
+                                                await asyncio.sleep(1.0)
                                                 await s_btn.click()
                                     except asyncio.TimeoutError:
                                         pass
