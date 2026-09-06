@@ -6,14 +6,15 @@ from telethon import TelegramClient, events
 from telethon.errors import RPCError
 
 from modules.autocatch import autocatch_command, handle_autocatch_trigger, get_catch_cfg
+from modules.autobat import autobat_command, handle_autobat_trigger, handle_manual_bat, get_bat_cfg
 from modules.automeow import automeow_command, resume_automeow_tasks, get_meow_config, process_schedule_event
 from modules.autofish import autofish_command, resume_autofish_tasks, get_fish_cfg
 from modules.autofridge import autofridge_command, resume_autofridge_tasks, get_fridge_cfg
 from modules.show import show_command, get_show_mode
 from modules.sched import sched_command
 from modules.alias import alias_command, resolve_alias
-from modules.proxy import get_proxy_kwargs
 
+# configuration filenames
 CONFIG_FILE = "config.json"
 EXAMPLE_CONFIG_FILE = "config.example.json"
 
@@ -24,7 +25,8 @@ def read_config():
                 c_data = s_file.read()
             with open(CONFIG_FILE, 'w', encoding='utf-8') as d_file:
                 d_file.write(c_data)
-            print(f"[!] '{CONFIG_FILE}' was missing. Created from template.")
+            print(f"[!] '{CONFIG_FILE}' was missing. Created from template. Please set api_id and api_hash.")
+            sys.exit(1)
         else:
             print(f"[!] Error: Config template '{EXAMPLE_CONFIG_FILE}' missing.")
             sys.exit(1)
@@ -32,13 +34,11 @@ def read_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             cfg_json = json.load(f)
-            multi = cfg_json.get("multi_session", False)
-            if not multi:
-                a_id = cfg_json.get("api_id")
-                a_hash = cfg_json.get("api_hash")
-                if not a_id or a_id == 123456 or not a_hash or a_hash == "YOUR_API_HASH_HERE":
-                    print(f"[!] Invalid api_id/api_hash in '{CONFIG_FILE}' for single-session mode.")
-                    sys.exit(1)
+            a_id = cfg_json.get("api_id")
+            a_hash = cfg_json.get("api_hash")
+            if not a_id or a_id == 123456 or not a_hash or a_hash == "YOUR_API_HASH_HERE":
+                print(f"[!] Invalid api_id/api_hash in '{CONFIG_FILE}'.")
+                sys.exit(1)
             return cfg_json
     except Exception as err:
         print(f"[!] Config load error: {err}")
@@ -74,6 +74,10 @@ async def status_command(ev):
     catch_st = "🟢 فعال" if c_cfg.get("status") else "🔴 غیرفعال"
     c_delay = c_cfg.get("delay", 0)
     c_times = c_cfg.get("times", 1)
+
+    b_cfg = get_bat_cfg(me_id).get(cid_str, {})
+    bat_st = "🟢 فعال" if b_cfg.get("status") else "🔴 غیرفعال"
+    b_delay = b_cfg.get("delay", 1)
     
     sh_st = "🟢 ON" if get_show_mode(me_id) else "🔴 OFF"
 
@@ -84,12 +88,14 @@ async def status_command(ev):
         f"🎣 **AutoFish:** {fish_st}\n"
         f"🧊 **AutoFridge:** {fridge_st}\n"
         f"🐈 **AutoCatch:** {catch_st} *(Delay: {c_delay}s, Times: {c_times})*\n"
+        f"🦇 **AutoBat:** {bat_st} *(Delay: {b_delay}s)*\n"
         f"👁️ **Show Mode:** {sh_st}\n\n"
         f"💡 **دستورات راهنما:**\n"
         f"▸ `/automeow` ── مدیریت ارسال خودکار کلمات میو (instant/schedule/off)\n"
         f"▸ `/autofish` ── مدیریت ماهیگیری خودکار\n"
         f"▸ `/autofridge` ── مدیریت پخت و فروش خودکار یخچال\n"
         f"▸ `/autocatch` ── مدیریت نجات خودکار گربه‌ها\n"
+        f"▸ `/autobat` ── مدیریت شکار خودکار خفاش 🦇\n"
         f"▸ `/show` ── خاموش/روشن کردن پاسخ به دستورات\n"
         f"▸ `/sched` ── زمانبندی پیام روی سرور تلگرام\n"
         f"▸ `/alias` ── تعریف اسم کوتاه و میانبر دستورات\n"
@@ -97,13 +103,13 @@ async def status_command(ev):
     )
     await ev.edit(msg_out)
 
-async def run_single_session(conf: dict):
+async def main():
+    conf = read_config()
     api_id = conf["api_id"]
     api_hash = conf["api_hash"]
-    proxy_kwargs = get_proxy_kwargs(conf)
     
-    print("[+] Single-Session: Connecting Telethon client...")
-    client = TelegramClient("meowace_self", api_id, api_hash, **proxy_kwargs)
+    print("[+] Connecting Telethon client...")
+    client = TelegramClient("meowace_self", api_id, api_hash)
     await client.start()
     
     me = await client.get_me()
@@ -114,6 +120,7 @@ async def run_single_session(conf: dict):
     async def _automeow_schedule_listener(ev):
         await process_schedule_event(ev)
 
+    # high priority autocatch trigger listeners
     @client.on(events.NewMessage)
     async def _autocatch_trigger_new(ev):
         await handle_autocatch_trigger(ev, is_edit=False)
@@ -122,6 +129,11 @@ async def run_single_session(conf: dict):
     async def _autocatch_trigger_edit(ev):
         await handle_autocatch_trigger(ev, is_edit=True)
 
+    @client.on(events.NewMessage)
+    async def _autobat_trigger_new(ev):
+        await handle_autobat_trigger(ev)
+
+    # bind event handlers
     @client.on(events.NewMessage(pattern='(?i)^/?automeow($|\\s+)'))
     async def _automeow_h(ev):
         await automeow_command(ev)
@@ -137,6 +149,20 @@ async def run_single_session(conf: dict):
     @client.on(events.NewMessage(pattern='(?i)^/?autocatch($|\\s+)'))
     async def _autocatch_h(ev):
         await autocatch_command(ev)
+
+    @client.on(events.NewMessage(pattern='(?i)^/?autobat($|\\s+)'))
+    async def _autobat_h(ev):
+        await autobat_command(ev)
+
+    @client.on(events.NewMessage(outgoing=True))
+    async def _manual_bat_h(ev):
+        # حالت دستی bat باید قبل از alias اجرا شود؛ اگر مصرف شد دیگر کاری نکن
+        try:
+            handled = await handle_manual_bat(ev)
+        except Exception as e:
+            print(f"[!] manual bat handler error: {e}")
+            handled = False
+        # اگر handled بود، alias نباید دوباره همان پیام را پردازش کند (پیام حذف شده)
 
     @client.on(events.NewMessage(pattern='(?i)^/?show(?:\\s+(.+))?'))
     async def _show_h(ev):
@@ -159,6 +185,9 @@ async def run_single_session(conf: dict):
         raw = ev.raw_text or ""
         if not raw:
             return
+        # پیام دستی batt قبلا مصرف (و حذف) شده؛ alias روی آن اجرا نشود
+        if raw.strip().lower().lstrip("/.=!") == "batt" and getattr(ev, 'is_reply', False):
+            return
         is_alias, cmds = resolve_alias(client.uid, raw)
         if is_alias and cmds:
             for c in cmds:
@@ -169,42 +198,13 @@ async def run_single_session(conf: dict):
                 except Exception:
                     pass
 
+    # restore loops
     asyncio.create_task(resume_automeow_tasks(client))
     asyncio.create_task(resume_autofish_tasks(client))
     asyncio.create_task(resume_autofridge_tasks(client))
-    print("[+] MeowAce-Self single-session client ready.")
+    print("[+] MeowAce-Self client ready.")
 
     await client.run_until_disconnected()
-
-async def run_multi_session(conf: dict):
-    from multisession import resume_all_sessions, subscription_monitor_loop
-    from bot_manager import start_bot_manager, bot_client_instance
-
-    print("[+] Multi-Session mode enabled.")
-    await resume_all_sessions(conf)
-
-    async def notify_expired(user_id: int, message: str):
-        if bot_client_instance and bot_client_instance.is_connected():
-            try:
-                await bot_client_instance.send_message(user_id, message)
-            except Exception as e:
-                print(f"[!] Could not send expiration message to {user_id}: {e}")
-
-    asyncio.create_task(subscription_monitor_loop(notify_expired))
-    await start_bot_manager(conf)
-    
-    from bot_manager import bot_client_instance as b_inst
-    if b_inst:
-        await b_inst.run_until_disconnected()
-
-async def main():
-    conf = read_config()
-    is_multi = conf.get("multi_session", False)
-    
-    if is_multi:
-        await run_multi_session(conf)
-    else:
-        await run_single_session(conf)
 
 if __name__ == "__main__":
     try:
