@@ -126,7 +126,17 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable --now meowace-self
+
+    # Register global CLI command
+    cat <<EOF | sudo tee /usr/local/bin/meowace > /dev/null
+#!/bin/bash
+cd "$DIR" || exit 1
+exec bash install.sh "\$@"
+EOF
+    sudo chmod +x /usr/local/bin/meowace
+
     echo -e "${GREEN}${BOLD}🎉 MeowAce-Self installed and running successfully as systemd service!${NC}"
+    echo -e "${CYAN}💡 You can now manage the panel anytime by typing: ${BOLD}meowace${NC}"
 }
 
 do_relogin() {
@@ -159,6 +169,9 @@ do_uninstall() {
         sudo systemctl disable meowace-self 2>/dev/null
         sudo rm -f /etc/systemd/system/meowace-self.service
         sudo systemctl daemon-reload
+
+        echo -e "${YELLOW}🗑️ Removing CLI shortcut...${NC}"
+        sudo rm -f /usr/local/bin/meowace
 
         echo -e "${YELLOW}🗑️ Removing sessions, virtualenv, and configs...${NC}"
         rm -rf venv meowace_self.session meowace_self.session-journal sessions/ config.json bot_config.json bot_data.json settings/
