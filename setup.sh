@@ -32,6 +32,14 @@ else
     cd "$INSTALL_DIR" && git pull origin main 2>/dev/null
 fi
 
+# Create global 'meowace' command
+cat <<EOF | sudo tee /usr/local/bin/meowace > /dev/null
+#!/bin/bash
+cd "$INSTALL_DIR" || exit 1
+exec bash install.sh "\$@"
+EOF
+sudo chmod +x /usr/local/bin/meowace
+
 cd "$INSTALL_DIR" || exit 1
 chmod +x install.sh
 exec bash install.sh "$@"
